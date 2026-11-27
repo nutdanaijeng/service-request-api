@@ -1,0 +1,29 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model ServiceRequest {
+  id          Int           @id @default(autoincrement())
+  citizenId   String        @map("citizen_id") @db.VarChar(13)
+  officeCode  String        @map("office_code") @db.VarChar(10)
+  description String?
+  status      RequestStatus @default(PENDING)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+  deletedAt   DateTime?     @map("deleted_at")
+
+  @@index([citizenId])
+  @@index([officeCode, status, createdAt(sort: Desc)])
+  @@map("service_request")
+}

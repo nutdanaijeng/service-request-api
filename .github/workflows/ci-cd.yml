@@ -1,0 +1,113 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1) CI: type-check, unit test, build, and apply migrations to a real Postgres
+  test:
+    name: Test & build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: appdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d appdb"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://app:secret@localhost:5432/appdb
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # 2) Smoke-test the Kubernetes manifests on a throwaway kind cluster
+  k8s-smoke:
+    name: Kubernetes smoke test (kind)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build -t service-request-api:local .
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+      - name: Load image into kind
+        run: kind load docker-image service-request-api:local --name ci
+      - name: Deploy
+        run: |
+          kubectl apply -k k8s
+          kubectl -n service-request rollout status statefulset/postgres --timeout=180s
+          kubectl -n service-request rollout status deployment/service-request-api --timeout=240s
+      - name: Call the API through the Service
+        run: |
+          kubectl -n service-request port-forward svc/service-request-api 8080:80 &
+          sleep 5
+          curl --fail -s http://localhost:8080/health/ready
+          curl --fail -s -X POST http://localhost:8080/service-requests \
+            -H 'Content-Type: application/json' \
+            -d '{"citizenId":"1234567890123","officeCode":"BKK01"}'
+          curl --fail -s "http://localhost:8080/service-requests?officeCode=BKK01"
+      - name: Debug on failure
+        if: failure()
+        run: |
+          kubectl -n service-request get pods -o wide
+          kubectl -n service-request describe pods
+          kubectl -n service-request logs -l app=service-request-api --all-containers --tail=100
+
+  # 3) CD: publish the image to GitHub Container Registry (main branch only)
+  publish:
+    name: Publish image to GHCR
+    needs: [test, k8s-smoke]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=raw,value=latest
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
