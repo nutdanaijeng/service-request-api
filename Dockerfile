@@ -6,12 +6,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first so `npm ci` is cached until dependencies change
+# Copy manifests + Prisma schema first so `npm ci` is cached until they change.
+# The schema must be present because `postinstall` runs `prisma generate`.
 COPY package.json package-lock.json ./
-RUN npm ci
-
 COPY prisma ./prisma
-RUN npx prisma generate
+RUN npm ci
 
 COPY tsconfig.json tsconfig.build.json nest-cli.json ./
 COPY src ./src
